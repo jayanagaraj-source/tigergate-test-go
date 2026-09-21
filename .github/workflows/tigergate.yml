@@ -1,0 +1,334 @@
+# TigerGate security scan.
+#
+# Runs the TigerGate CLI container against this repository and uploads the
+# results to the TigerGate environment selected below.
+#
+# The CLI image is fully driven by workflow inputs (cli_image / cli_tag), so a
+# custom or private build can be tested by dispatching with different values --
+# no edit to this file required. On push/PR the defaults apply.
+#
+# Ground truth for every expected count in this file lives in
+# SECURITY_FIXTURES.md, which is generated from the source annotations. When a
+# fixture is added or changed, update that file and the expectations here
+# together.
+name: TigerGate Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      cli_image:
+        description: "TigerGate CLI image (without tag)"
+        type: string
+        required: true
+        default: tigergate/tigergate-cli
+      cli_tag:
+        description: "TigerGate CLI image tag"
+        type: string
+        required: true
+        default: latest
+      scan_type:
+        description: "Scan type to run"
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - sast
+          - sca
+          - secrets
+          - iac
+      quality_gate:
+        description: "Enforce the quality gate (fails the job when the gate fails)"
+        type: boolean
+        required: true
+        default: false
+      resolve_go:
+        description: "Install Go so SCA resolves the full module build list (changes the SBOM package count -- see note in the step)"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+
+jobs:
+  scan:
+    name: TigerGate ${{ inputs.scan_type || 'all' }} scan
+    runs-on: ubuntu-latest
+
+    # The whole job runs inside the selected TigerGate CLI image.
+    container:
+      image: ${{ inputs.cli_image || 'tigergate/tigergate-cli' }}:${{ inputs.cli_tag || 'latest' }}
+      # The image declares ENTRYPOINT ["tigergate"]. GitHub Actions overrides the
+      # entrypoint itself to keep the container alive and then execs each step in
+      # a shell, so no `options: --entrypoint` override is needed here.
+
+    env:
+      TIGERGATE_API_KEY: ${{ secrets.TIGERGATE_API_KEY }}
+      TIGERGATE_API_URL: ${{ vars.TIGERGATE_API_URL || 'https://api.staging.tigergate.dev' }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # go.mod declares `go 1.23`. Without GOTOOLCHAIN=local the Go command
+      # silently downloads a newer toolchain whenever a tool it shells out to
+      # asks for one, which changes the analyser version mid-run and makes the
+      # SAST count unreproducible. Pin it to whatever is installed.
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=mod
+      GOPROXY: https://proxy.golang.org,direct
+      # Keep the module cache inside the workspace so it is visible to both the
+      # resolution step and the scanner, and so actions/cache can reach it.
+      GOMODCACHE: ${{ github.workspace }}/.gomodcache
+      GOPATH: ${{ github.workspace }}/.gopath
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history is REQUIRED, not an optimisation. The secret scanner
+          # runs `gitleaks detect`, which walks git HISTORY rather than the
+          # working tree: on a shallow clone it sees one commit, and on a
+          # checkout with no commits it sees none and reports zero secrets even
+          # though the files are sitting right there.
+          #
+          # NOTE for this fixture specifically: none of its planted secrets
+          # exist ONLY in history -- every one is still present at HEAD, so a
+          # shallow clone would happen to find them in the working tree too.
+          # fetch-depth: 0 is kept anyway so the history-walking code path is
+          # actually exercised here and behaves identically to the other
+          # language fixtures. A secrets count of 0 therefore does NOT indicate
+          # a truncated checkout in this repo -- it indicates the secret scanner
+          # did not run at all.
+          fetch-depth: 0
+
+      - name: Configure git safe.directory
+        # The container runs as root while the workspace is checked out by the
+        # runner user, so git refuses to operate on it ("dubious ownership")
+        # until the path is explicitly trusted.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
+          git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD
+          echo "commits in history: $(git -C "$GITHUB_WORKSPACE" rev-list --count HEAD)"
+
+      - name: TigerGate CLI version
+        # Printed before the scan so the exact CLI build under test is recorded
+        # in the job log.
+        run: tigergate --version
+
+      - name: Prepare dependency resolution for SCA
+        # This repository declares its dependencies in the standard Go pair:
+        #   go.mod   7 direct requires + 13 `// indirect` = 20 modules
+        #   go.sum   29 modules (adds test-only deps of deps, which never link
+        #            into a binary)
+        #
+        # `go list -m all` reports 30 modules -- the 29 from go.sum plus
+        # github.com/ugorji/go, whose v1.1.7 root module is in the graph while
+        # only its /codec subpackage is imported.
+        #
+        # The CLI resolves Go through `go list -m all` when the toolchain is on
+        # PATH, and falls back to parsing go.mod when it is not. The CLI image
+        # ships NO Go toolchain, so the default run is manifest parsing: the 20
+        # modules named in go.mod, 7 of them Direct and 13 Transitive.
+        #
+        # That default is deliberate here. SECURITY_FIXTURES.md's ground truth is
+        # exactly the 20 go.mod declarations, and the fixture's whole point is
+        # that a correct scan reads the committed manifest rather than build
+        # output. Set resolve_go=true to install Go and exercise full build-list
+        # resolution instead -- the package count then legitimately becomes 30,
+        # so do not compare that run against the 20-package table.
+        #
+        # No vendor/ directory is committed on purpose, so there is no second
+        # copy of the dependency tree for the scanner to pick up instead.
+        if: contains(fromJSON('["all","sca"]'), inputs.scan_type || 'all')
+        run: |
+          set -e
+          echo "----- resolver availability in this image -----"
+          for t in syft trivy grype go gosec govulncheck git gitleaks semgrep; do
+            if command -v "$t" >/dev/null 2>&1; then
+              printf '  present  %-12s %s\n' "$t" "$(command -v "$t")"
+            else
+              printf '  absent   %s\n' "$t"
+            fi
+          done
+
+          echo "----- Go manifests found -----"
+          find . -name 'go.mod' -not -path './.gomodcache/*' -not -path './vendor/*' -print
+          find . -name 'go.sum' -not -path './.gomodcache/*' -not -path './vendor/*' -print
+
+          echo "----- declared module counts (parsed from go.mod, no toolchain needed) -----"
+          # Read the require blocks directly so these numbers are available even
+          # when Go is absent. Direct = a require line with no `// indirect`.
+          # A require line is `<tab><module path> <version>`; the module path
+          # contains slashes, so the path class must not exclude them.
+          REQLINES='^[[:space:]]+[^[:space:]]+[[:space:]]+v[0-9]'
+          DIRECT=$(grep -E "$REQLINES" go.mod | grep -vc '// indirect' || true)
+          INDIRECT=$(grep -cE "$REQLINES.*// indirect" go.mod || true)
+          SUMMODS=$(awk '{print $1}' go.sum 2>/dev/null | sort -u | wc -l || echo 0)
+          echo "  go.mod direct   : $DIRECT   (expected 7)"
+          echo "  go.mod indirect : $INDIRECT   (expected 13)"
+          echo "  go.mod total    : $((DIRECT + INDIRECT))   (expected 20 -- this is the SBOM ground truth)"
+          echo "  go.sum modules  : $SUMMODS   (expected 29)"
+
+          if [ "${{ inputs.resolve_go || 'false' }}" != "true" ]; then
+            echo "::notice::resolve_go=false - Go dependencies are read from the committed go.mod (20 modules: 7 Direct, 13 Transitive). This matches the ground truth in SECURITY_FIXTURES.md."
+            exit 0
+          fi
+
+          if ! command -v go >/dev/null 2>&1; then
+            echo "----- installing Go 1.23 -----"
+            GO_TARBALL=go1.23.12.linux-amd64.tar.gz
+            curl -sSLo "/tmp/$GO_TARBALL" "https://go.dev/dl/$GO_TARBALL" \
+              || { echo "::warning::Go download failed - SCA falls back to manifest parsing."; exit 0; }
+            tar -C /usr/local -xzf "/tmp/$GO_TARBALL" \
+              || { echo "::warning::Go extract failed - SCA falls back to manifest parsing."; exit 0; }
+            ln -sf /usr/local/go/bin/go /usr/local/bin/go
+            ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+          fi
+
+          go version || { echo "::warning::go is installed but will not start - SCA falls back to manifest parsing."; exit 0; }
+
+          # Populate the module cache so the scanner's own `go list` does not
+          # have to reach the network mid-scan. `download all` covers the full
+          # build list, not just the packages that are imported.
+          # `download all` writes hashes for the whole build list, which adds a
+          # go.sum entry (golang.org/x/term, a test-only dep of a dep) that the
+          # committed 29-module go.sum does not carry. Work on a copy so the
+          # scan still sees the committed manifest unmodified.
+          cp go.sum /tmp/go.sum.committed
+          go mod download all \
+            || echo "::warning::go mod download failed - SCA may fall back to manifest parsing for the affected modules."
+          if ! cmp -s go.sum /tmp/go.sum.committed; then
+            echo "::notice::go mod download added transitive hashes to go.sum; restoring the committed file so SCA reads the 29-module manifest as checked in."
+            cp /tmp/go.sum.committed go.sum
+          fi
+
+          echo "----- resolved build list -----"
+          go list -m all | tail -n +2 | tee /tmp/build-list.txt | sed 's/^/  /'
+          echo "  build list total: $(wc -l < /tmp/build-list.txt)   (expected 30)"
+          echo "::notice::resolve_go=true - SCA resolves the full build list (30 modules). Do NOT compare this run against the 20-package go.mod table."
+
+      - name: Run TigerGate scan
+        id: scan
+        run: |
+          set -o pipefail
+          # NOTE ON --exclude: nothing is excluded here, on purpose.
+          #
+          # This repo commits no build output, so a correct scan has no compiled
+          # artefact to be fooled by -- but it must still get three things right
+          # on its own:
+          #
+          #   1. The only manifest paths it may report are ./go.mod and ./go.sum
+          #      at the repo root. A path under .gomodcache/ or .gopath/ (created
+          #      by the step above) means it walked the downloaded module cache
+          #      and is reporting other projects' manifests as this project's.
+          #   2. It must never report a package named example.com/tigergate-test-go
+          #      -- that is this module itself, not a dependency.
+          #   3. tests/app_test.go is Go test code and src/*.go carries `// SAFE:`
+          #      negative controls. Both must be scanned; the SAFE functions must
+          #      NOT be reported. See SECURITY_FIXTURES.md for that list.
+          #
+          # Excluding paths here would make all three checks vacuous.
+          tigergate scan \
+            --type "${{ inputs.scan_type || 'all' }}" \
+            --scan-scope full \
+            --upload \
+            --quality-gate=${{ inputs.quality_gate || 'false' }} \
+            2>&1 | tee /tmp/tigergate-scan.log
+
+      - name: Scan result
+        if: always()
+        run: |
+          LOG=/tmp/tigergate-scan.log
+
+          # Resolve one reported value. Uses the scan step's output first (for CLI
+          # builds that write to $GITHUB_OUTPUT), otherwise scans the captured log
+          # for the given label patterns. mode controls how the value is cut out of
+          # the matched text: num = trailing integer, url = the URL itself (never
+          # split on its own ":"), str = whatever follows the label separator.
+          extract() {
+            mode="$1"; preset="$2"; shift 2
+            if [ -n "$preset" ]; then printf '%s\n' "$preset"; return; fi
+            [ -f "$LOG" ] || { echo "n/a"; return; }
+            for pat in "$@"; do
+              m=$(grep -aioE "$pat" "$LOG" | tail -1)
+              [ -n "$m" ] || continue
+              case "$mode" in
+                num) v=$(printf '%s' "$m" | grep -oE '[0-9]+' | tail -1) ;;
+                url) v=$(printf '%s' "$m" | grep -oE 'https?://[^[:space:]"]+') ;;
+                # A bare UUID carries no label separator, so only strip one
+                # when the match actually has a `label: value` shape.
+                *)   v=$(printf '%s' "$m" | sed -E 's/^.*[A-Za-z][[:space:]]*[:=][[:space:]]*//') ;;
+              esac
+              v=$(printf '%s' "$v" | sed -E 's/\x1b\[[0-9;]*m//g; s/^[[:space:]]+//; s/[[:space:]]+$//')
+              [ -n "$v" ] && { printf '%s\n' "$v"; return; }
+            done
+            echo "n/a"
+          }
+
+          # Second pattern is a fallback: the dashboard URL embeds the scan UUID
+          # (…/code-security/<uuid>?activeTab=…) even when the CLI prints no
+          # explicit "scan id" label.
+          SCAN_ID=$(extract  str "${{ steps.scan.outputs.scan_id }}"        'scan[ _-]?id[^A-Za-z0-9]{1,4}[A-Za-z0-9_-]+' '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+          GATE=$(extract     str "${{ steps.scan.outputs.gate_status }}"    'quality[ _-]?gate[^:=]*[:=][[:space:]]*[A-Za-z]+' 'gate[ _-]?status[:=][[:space:]]*[A-Za-z]+')
+          TOTAL=$(extract    num "${{ steps.scan.outputs.total_findings }}" 'total[ _-]?findings[^0-9]{0,10}[0-9]+' 'total[^0-9a-z]{1,10}[0-9]+')
+          CRITICAL=$(extract num "${{ steps.scan.outputs.critical_count }}" 'critical[^0-9a-z]{0,10}[0-9]+')
+          HIGH=$(extract     num "${{ steps.scan.outputs.high_count }}"     'high[^0-9a-z]{0,10}[0-9]+')
+          SECRETS=$(extract  num ""                                         'secrets?[^0-9a-z]{0,12}[0-9]+' '[0-9]+[[:space:]]+secrets?')
+          PACKAGES=$(extract num ""                                         'packages?[^0-9a-z]{0,12}[0-9]+' '[0-9]+[[:space:]]+packages?')
+          # `code-security` is the path the TigerGate UI actually serves results
+          # under (…/code-security/<scan uuid>?activeTab=sbom); without it a
+          # localhost or self-hosted dashboard link is missed entirely.
+          URL=$(extract      url "${{ steps.scan.outputs.dashboard_url }}"  'https?://[^[:space:]"]*(code-security|scan|finding|dashboard|report)[^[:space:]"]*')
+
+          {
+            echo "## TigerGate scan result"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| CLI image | \`${{ inputs.cli_image || 'tigergate/tigergate-cli' }}:${{ inputs.cli_tag || 'latest' }}\` |"
+            echo "| Scan type | \`${{ inputs.scan_type || 'all' }}\` |"
+            echo "| Go build-list resolution | \`${{ inputs.resolve_go || 'false' }}\` |"
+            echo "| Quality gate enforced | \`${{ inputs.quality_gate || 'false' }}\` |"
+            echo "| Scan outcome | \`${{ steps.scan.outcome }}\` |"
+            echo "| Scan ID | $SCAN_ID |"
+            echo "| Gate status | $GATE |"
+            echo "| Total findings | $TOTAL |"
+            echo "| Critical | $CRITICAL |"
+            echo "| High | $HIGH |"
+            echo "| Secrets | $SECRETS |"
+            echo "| SBOM packages | $PACKAGES |"
+            echo "| Dashboard / findings URL | $URL |"
+            echo
+            echo "### Expected for this fixture"
+            echo
+            echo "| Scanner | Expectation | Reference baseline |"
+            echo "|---|---|---|"
+            echo "| SCA / SBOM | 20 packages, 8 of them vulnerable | \`go.mod\`: 7 Direct + 13 Transitive |"
+            echo "| SCA reachability | 12 advisories reachable from code | \`govulncheck\` |"
+            echo "| SAST | ~73 findings over ~38 rule classes | \`gosec v2.29.0\`: 24 HIGH / 40 MEDIUM / 9 LOW |"
+            echo "| Secrets | ~23 planted values (see SECURITY_FIXTURES.md) | \`gitleaks\` default rules match only 1 |"
+            echo "| IaC | Terraform S3 public-access block + K8s hostNetwork/privileged/runAsUser 0/plaintext env password + Dockerfile no USER | -- |"
+            echo "| Negative controls | 8 \`// SAFE:\` functions must NOT be reported | \`gosec\` false-positives on 1 (\`ReadUserFileSafe\`) |"
+            echo
+            echo "With \`resolve_go=true\` the SBOM legitimately reports 30 packages instead of 20."
+            echo
+            echo "The secrets expectation is a range because detector rulesets differ sharply"
+            echo "here: most planted values are deliberately shaped like real credentials but"
+            echo "are synthetic, and some detectors allowlist the vendor's own documentation"
+            echo "examples (\`AKIAIOSFODNN7EXAMPLE\`). Two fixtures (Slack, Stripe) had their"
+            echo "vendor token shapes removed because GitHub push protection rejects any push"
+            echo "containing them, so they exercise keyword detection only. Compare against the"
+            echo "per-constant table in SECURITY_FIXTURES.md rather than against a single number."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # The value extraction above is best-effort: if this CLI build labels
+          # its summary differently, the fields read "n/a" and the raw output
+          # below is the source of truth.
+          echo
+          echo "----- raw CLI output (last 100 lines) -----"
+          if [ -f "$LOG" ]; then tail -100 "$LOG"; else echo "no scan log produced"; fi
