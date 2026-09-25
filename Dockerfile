@@ -1,4 +1,8 @@
-FROM alpine:3.21
-WORKDIR /app
+FROM golang:1.23-alpine AS build
+WORKDIR /src
 COPY . .
-CMD ["sh", "-c", "echo tigergate-test-go"]
+RUN go build -o /out/app ./src/...
+
+FROM alpine:3.21
+COPY --from=build /out/app /usr/local/bin/app
+CMD ["app"]
